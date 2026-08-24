@@ -11,6 +11,7 @@
 #include <vector>
 
 #include "NeuraDialect/Architecture/ArchitectureSpec.h"
+#include "llvm/ADT/StringRef.h"
 
 namespace mlir {
 namespace neura {
@@ -23,13 +24,6 @@ enum class ResourceKind {
   Register,
   RegisterFile,
   RegisterFileCluster,
-};
-
-// Enumeration for function unit resource type.
-enum class FunctionUnitKind {
-  FixedPointAdder,
-  FixedPointMultiplier,
-  CustomizableFunctionUnit,
 };
 
 // Enumeration for supported operation types.
@@ -91,7 +85,17 @@ enum OperationKind {
   ICtrlMov = 40,
   // Counter operations.
   ICounter = 41,
-  IExtractPredicate = 42
+  IExtractPredicate = 42,
+  // No modelled functional unit.
+  //
+  // Returned by getOperationKindFromMlirOp for any op whose FU is not described
+  // here (neura.carry / merge / invariant / true_steer / false_steer / fmax /
+  // fmin / mul_add / vadd / vmul / vfadd / memset / gather / ...). It is
+  // deliberately absent from kFuTypesToOperations, so fuClassOf reports "other"
+  // and tilesProvidingFuClass returns EVERY tile: unknown means unconstrained,
+  // never infeasible. This used to be spelled `IAdd`, which claimed the op ran
+  // on an adder and priced it against the adder capacity.
+  IUnknown = 43
 };
 
 // Maps hardware resource names to their supported operations.
@@ -159,6 +163,25 @@ public:
 // Forward declaration for use in Tile.
 class Tile;
 class Link;
+
+// Sets of tiles and links, ordered by id rather than by address.
+//
+// `std::set<Tile *>` iterates in ADDRESS order, and these objects are
+// heap-allocated, so the order differs from one process to the next. Every
+// consumer that walks a tile's neighbours or outgoing links picks among
+// equal-cost candidates in the order given, which carries that difference into
+// the placement, the routing and the resulting II. Measured before this
+// comparator existed: the same binary on the same input produced
+// `plain_gemm` = 393218 seven times out of eight and 262147 once, the two runs
+// first differing at a data move routed through link#3-7-20 in one and
+// link#4-14-20 in the other -- same length, same arrival, different choice.
+struct ByResourceId {
+  template <typename T> bool operator()(const T *lhs, const T *rhs) const {
+    return lhs->getId() < rhs->getId();
+  }
+};
+using TileSet = std::set<Tile *, ByResourceId>;
+using LinkSet = std::set<Link *, ByResourceId>;
 class FunctionUnit;
 class Register;
 class RegisterFile;
@@ -184,17 +207,8 @@ public:
 
   void setTile(Tile *tile);
 
-  std::set<OperationKind> getSupportedOperations() const {
-    return supported_operations;
-  }
-
   bool canSupportOperation(OperationKind operation) const {
-    for (const auto &op : supported_operations) {
-      if (op == operation) {
-        return true;
-      }
-    }
-    return false;
+    return supported_operations.count(operation) != 0;
   }
 
 protected:
@@ -222,6 +236,9 @@ public:
 class Tile : public BasicResource {
 public:
   Tile(int id, int x, int y);
+  // Out-of-line so `register_file_cluster` (a forward-declared type at this
+  // point in the header) is complete where the unique_ptr is destroyed.
+  ~Tile() override;
 
   int getId() const override;
   std::string getType() const override { return "tile"; }
@@ -237,10 +254,10 @@ public:
 
   void linkDstTile(Link *link, Tile *tile);
   void unlinkDstTile(Link *link, Tile *tile);
-  const std::set<Tile *> &getDstTiles() const;
-  const std::set<Tile *> &getSrcTiles() const;
-  const std::set<Link *> &getOutLinks() const;
-  const std::set<Link *> &getInLinks() const;
+  const TileSet &getDstTiles() const;
+  const TileSet &getSrcTiles() const;
+  const LinkSet &getOutLinks() const;
+  const LinkSet &getInLinks() const;
 
   void addFunctionUnit(std::unique_ptr<FunctionUnit> func_unit) {
     assert(func_unit && "Cannot add null function unit");
@@ -265,42 +282,32 @@ public:
     return false;
   }
 
-  void addRegisterFileCluster(RegisterFileCluster *register_file_cluster);
-
-  const RegisterFileCluster *getRegisterFileCluster() const;
+  // Takes ownership of the cluster (and, transitively, of its register files
+  // and registers). Replacing an existing cluster frees the WHOLE old subtree;
+  // the previous raw-pointer version `delete`d only the cluster object itself
+  // and leaked every RegisterFile and Register underneath it -- 36 blocks per
+  // replaced cluster, and a replacement happens once per tile carrying a
+  // `num_registers` override. Nothing was freed at teardown either, because a
+  // raw pointer member has no destructor.
+  void addRegisterFileCluster(
+      std::unique_ptr<RegisterFileCluster> register_file_cluster);
 
   const std::vector<RegisterFile *> getRegisterFiles() const;
 
   const std::vector<Register *> getRegisters() const;
 
-  // Port management.
-  const std::vector<std::string> &getPorts() const { return ports; }
-  void setPorts(const std::vector<std::string> &new_ports) {
-    ports = new_ports;
-  }
-  bool hasPort(const std::string &port) const {
-    return std::find(ports.begin(), ports.end(), port) != ports.end();
-  }
-
-  // Memory management.
-  int getMemoryCapacity() const { return memory_capacity; }
-  void setMemoryCapacity(int capacity) { memory_capacity = capacity; }
-
 private:
   int id;
   int x, y;
-  std::set<Tile *> src_tiles;
-  std::set<Tile *> dst_tiles;
-  std::set<Link *> in_links;
-  std::set<Link *> out_links;
+  TileSet src_tiles;
+  TileSet dst_tiles;
+  LinkSet in_links;
+  LinkSet out_links;
   std::vector<std::unique_ptr<FunctionUnit>>
       functional_unit_storage;               // Owns FUs.
   std::set<FunctionUnit *> functional_units; // Non-owning, for fast lookup.
-  RegisterFileCluster *register_file_cluster = nullptr;
-
-  // Port and memory configuration.
-  std::vector<std::string> ports;
-  int memory_capacity = -1; // -1 means not configured.
+  std::unique_ptr<RegisterFileCluster>
+      register_file_cluster; // Owns the cluster subtree.
 };
 
 //===----------------------------------------------------------------------===//
@@ -328,8 +335,8 @@ public:
   // Link properties.
   int getLatency() const { return latency; }
   int getBandwidth() const { return bandwidth; }
-  void setLatency(int l) { latency = l; }
-  void setBandwidth(int b) { bandwidth = b; }
+  void setLatency(int new_latency) { latency = new_latency; }
+  void setBandwidth(int new_bandwidth) { bandwidth = new_bandwidth; }
 
 private:
   int id;
@@ -393,15 +400,16 @@ public:
 
   void setRegisterFileCluster(RegisterFileCluster *register_file_cluster);
 
-  void addRegister(Register *reg);
+  // Takes ownership of the register.
+  void addRegister(std::unique_ptr<Register> reg);
 
   const std::map<int, Register *> &getRegisters() const;
-  RegisterFileCluster *getRegisterFileCluster() const;
 
 private:
   int id;
-  std::map<int, Register *> registers;
-  RegisterFileCluster *register_file_cluster = nullptr;
+  std::vector<std::unique_ptr<Register>> register_storage; // Owns registers.
+  std::map<int, Register *> registers; // Non-owning, keyed by global id.
+  RegisterFileCluster *register_file_cluster = nullptr; // Non-owning parent.
 };
 
 //===----------------------------------------------------------------------===//
@@ -426,13 +434,16 @@ public:
   Tile *getTile() const;
   void setTile(Tile *tile);
 
-  void addRegisterFile(RegisterFile *register_file);
+  // Takes ownership of the register file (and its registers).
+  void addRegisterFile(std::unique_ptr<RegisterFile> register_file);
   const std::map<int, RegisterFile *> &getRegisterFiles() const;
 
 private:
   int id;
   Tile *tile;
-  std::map<int, RegisterFile *> register_files;
+  std::vector<std::unique_ptr<RegisterFile>>
+      register_file_storage;                    // Owns register files.
+  std::map<int, RegisterFile *> register_files; // Non-owning, keyed by id.
 };
 
 //===----------------------------------------------------------------------===//
@@ -468,7 +479,6 @@ public:
                const std::vector<LinkOverride> &link_overrides =
                    std::vector<LinkOverride>());
 
-  Tile *getTile(int id);
   Tile *getTile(int x, int y);
 
   int getMultiCgraRows() const { return multi_cgra_rows_; }
@@ -477,7 +487,6 @@ public:
   int getPerCgraColumns() const { return per_cgra_columns_; }
   int getMaxCtrlMemItems() const { return max_ctrl_mem_items_; }
 
-  Link *getLink(int id);
   Link *getLink(int src_tile_x, int src_tile_y, int dst_tile_x, int dst_tile_y);
   void removeLink(int link_id);
   void removeLink(Tile *src_tile, Tile *dst_tile);
@@ -504,7 +513,11 @@ public:
   // Example — create a 12×8 bounding box for a T-shape (4 CGRAs) where only
   // specific tiles are valid:
   //   std::vector<TileOverride> overrides;
-  //   // First mark all tiles as non-existent, then mark valid ones existent.
+  //   // Mark ONLY the tiles absent from the valid set as existence=false;
+  //   // leave valid tiles untouched so they keep their default configuration.
+  //   // Do NOT mark every tile non-existent and then re-mark the valid ones
+  //   // existent: removeTile() erases a tile destructively, so an
+  //   // existence=true override cannot resurrect it.
   //   // (see MapToAcceleratorPass for the full valid_tiles parsing logic)
   //   auto arch_T = getArchitecture().cloneWithNewDimensions(8, 12, overrides);
   std::unique_ptr<Architecture> cloneWithNewDimensions(
@@ -522,7 +535,10 @@ private:
   void createRegisterFileCluster(Tile *tile, int num_registers,
                                  int &num_already_assigned_global_registers,
                                  int global_id_start = -1);
-  bool linkExists(Tile *src_tile, Tile *dst_tile);
+  // The single lookup of "the link that carries src_tile -> dst_tile", shared
+  // by getLink(), applyLinkOverrides() and removeLink(). Returns nullptr when
+  // the two tiles are not directly connected.
+  Link *findLink(Tile *src_tile, Tile *dst_tile) const;
 
   // Helper methods for creating different topology links.
   void createSingleLink(int &link_id, Tile *src_tile, Tile *dst_tile,
@@ -557,6 +573,45 @@ private:
   LinkDefaults link_defaults_;
   std::vector<LinkOverride> link_overrides_;
 };
+
+// Builds the architecture a candidate SHAPE actually gets: an `x_tiles` x
+// `y_tiles` bounding box from which every tile absent from `valid_tiles` has
+// been removed. This is the one place that turns a `valid-tiles` string into an
+// `Architecture`, so the mapper, the exact CP-SAT oracle, --dump-dfg-json,
+// --cost-model-analytical and the task allocator all price a non-rectangular
+// (L- or T-shaped) candidate on the SAME tiles. Previously each of them parsed
+// the string itself (or, in the allocator's case, did not parse it at all and
+// priced the full bounding rectangle, systematically under-pricing every
+// non-rectangular candidate by the tiles it does not own).
+//
+// `valid_tiles` is a comma-separated list of `x_y` coordinates; whitespace
+// around an entry or around either coordinate is tolerated, so "0_0, 1_1"
+// parses. A coordinate outside the x/y-tiles grid is reported and ignored
+// rather than allowed to remove a real tile through a typo. An empty (or
+// entirely unparsable) list yields the full rectangle -- see below.
+//
+// `diag_tag` prefixes the two diagnostics ("[cost-model-analytical]",
+// "[MapToAcceleratorPass]", ...) so a warning still names its caller.
+//
+// Returns nullptr when x_tiles/y_tiles are not both positive: the caller then
+// keeps the global architecture singleton unchanged.
+//
+// IMPLEMENTATION NOTE, carried from MapToAcceleratorPass. Only the tiles ABSENT
+// from the valid set get an existence=false override; valid tiles are left
+// untouched so they keep their full default/YAML configuration (FU types,
+// register files). Do NOT mark every tile non-existent and then try to re-mark
+// the valid ones existent: removeTile() erases a tile destructively (from
+// tile_storage_/id_to_tile_/coord_to_tile_), so a subsequent existence=true
+// override cannot resurrect it -- it looks the tile up by coordinate, finds
+// nothing, and is silently dropped. That left the cloned architecture with zero
+// tiles, which inflated res_mii up to max_ii and made every op report "No
+// candidate locations found". For the same reason a valid set that selects NO
+// tile in the grid falls back to the full rectangle with a warning instead of
+// producing a zero-tile architecture.
+std::unique_ptr<Architecture>
+buildShapedArchitecture(const Architecture &global_arch, int x_tiles,
+                        int y_tiles, llvm::StringRef valid_tiles,
+                        llvm::StringRef diag_tag);
 
 // Function for getting the architecture object.
 const Architecture &getArchitecture();

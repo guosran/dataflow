@@ -1,21 +1,26 @@
 #include "NeuraDialect/Architecture/Architecture.h"
+#include "llvm/ADT/SmallVector.h"
 #include "llvm/Support/raw_ostream.h"
 #include <algorithm>
 #include <cassert>
 #include <memory>
+#include <set>
 #include <string>
+#include <utility>
 #include <vector>
 
 using namespace mlir;
 using namespace mlir::neura;
 
+namespace {
+
 // Configures all supported operations for a function unit.
 void configureSupportedOperations(CustomizableFunctionUnit *function_unit,
-                                  const std::string &operation) {
-  auto it = kFuTypesToOperations.find(operation);
-  if (it != kFuTypesToOperations.end()) {
-    for (const auto &operation : it->second) {
-      function_unit->addSupportedOperation(operation);
+                                  const std::string &fu_class) {
+  auto found = kFuTypesToOperations.find(fu_class);
+  if (found != kFuTypesToOperations.end()) {
+    for (OperationKind operation_kind : found->second) {
+      function_unit->addSupportedOperation(operation_kind);
     }
   } else {
     assert(false && "Unknown operation specified for function unit");
@@ -25,13 +30,13 @@ void configureSupportedOperations(CustomizableFunctionUnit *function_unit,
 // Creates a function unit for a specific operation.
 // Maps YAML operation names to OperationKind enum values and creates
 // appropriate function units.
-void createFunctionUnitForOperation(Tile *tile, const std::string &operation,
+void createFunctionUnitForOperation(Tile *tile, const std::string &fu_class,
                                     int function_unit_id) {
   auto function_unit =
       std::make_unique<CustomizableFunctionUnit>(function_unit_id);
 
   // Configures all supported operations using the unified function.
-  configureSupportedOperations(function_unit.get(), operation);
+  configureSupportedOperations(function_unit.get(), fu_class);
 
   // TODO: Adds support for unknown operations with warning instead of silent
   // failure. Such support would help users identify typos in their YAML
@@ -40,23 +45,28 @@ void createFunctionUnitForOperation(Tile *tile, const std::string &operation,
   tile->addFunctionUnit(std::move(function_unit));
 }
 
-// Configures tile function units based on operations.
+// Configures a tile's function units from the YAML fu_types specification. If
+// clear_existing is true, this replaces any existing function units with the
+// specified ones.
 void configureTileFunctionUnits(Tile *tile,
-                                const std::vector<std::string> &operations,
+                                const std::vector<std::string> &fu_classes,
                                 bool clear_existing = true) {
-  // Configures function units based on YAML operations specification.
-  // If clear_existing is true, this replaces any existing function units with
-  // the specified ones.
-
   if (clear_existing) {
     tile->clearFunctionUnits();
   }
 
   int function_unit_id = 0;
-  for (const auto &operation : operations) {
-    createFunctionUnitForOperation(tile, operation, function_unit_id++);
+  for (const std::string &fu_class : fu_classes) {
+    createFunctionUnitForOperation(tile, fu_class, function_unit_id++);
   }
 }
+
+// Checks if a tile is on the boundary of the architecture.
+bool isTileOnBoundary(int x, int y, int rows, int columns) {
+  return (x == 0 || x == columns - 1 || y == 0 || y == rows - 1);
+}
+
+} // namespace
 
 //===----------------------------------------------------------------------===//
 // Tile
@@ -67,6 +77,11 @@ Tile::Tile(int id, int x, int y) {
   this->x = x;
   this->y = y;
 }
+
+// Defined here, where RegisterFileCluster is complete, so the unique_ptr member
+// can be destroyed. Destroying the cluster destroys its register files, and
+// each of those its registers.
+Tile::~Tile() = default;
 
 int Tile::getId() const { return id; }
 
@@ -90,29 +105,26 @@ void Tile::unlinkDstTile(Link *link, Tile *tile) {
   tile->in_links.erase(link);
 }
 
-const std::set<Tile *> &Tile::getDstTiles() const { return dst_tiles; }
+const TileSet &Tile::getDstTiles() const { return dst_tiles; }
 
-const std::set<Tile *> &Tile::getSrcTiles() const { return src_tiles; }
+const TileSet &Tile::getSrcTiles() const { return src_tiles; }
 
-const std::set<Link *> &Tile::getOutLinks() const { return out_links; }
+const LinkSet &Tile::getOutLinks() const { return out_links; }
 
-const std::set<Link *> &Tile::getInLinks() const { return in_links; }
+const LinkSet &Tile::getInLinks() const { return in_links; }
 
-void Tile::addRegisterFileCluster(RegisterFileCluster *register_file_cluster) {
+void Tile::addRegisterFileCluster(
+    std::unique_ptr<RegisterFileCluster> register_file_cluster) {
   assert(register_file_cluster && "Cannot add null register file cluster");
   if (this->register_file_cluster != nullptr) {
     llvm::errs() << "Warning: Overwriting existing register file cluster ("
                  << this->register_file_cluster->getId() << ") in Tile "
                  << this->id << "\n";
-    // Removes the old register file cluster before adding the new one.
-    delete this->register_file_cluster;
   }
-  this->register_file_cluster = register_file_cluster;
-  register_file_cluster->setTile(this);
-}
-
-const RegisterFileCluster *Tile::getRegisterFileCluster() const {
-  return register_file_cluster;
+  // Assigning through the unique_ptr frees the old cluster together with its
+  // register files and registers.
+  this->register_file_cluster = std::move(register_file_cluster);
+  this->register_file_cluster->setTile(this);
 }
 
 const std::vector<RegisterFile *> Tile::getRegisterFiles() const {
@@ -209,17 +221,16 @@ void RegisterFile::setRegisterFileCluster(
   this->register_file_cluster = register_file_cluster;
 }
 
-void RegisterFile::addRegister(Register *reg) {
-  registers[reg->getId()] = reg;
-  reg->setRegisterFile(this);
+void RegisterFile::addRegister(std::unique_ptr<Register> reg) {
+  assert(reg && "Cannot add null register");
+  Register *reg_ptr = reg.get();
+  register_storage.push_back(std::move(reg));
+  registers[reg_ptr->getId()] = reg_ptr;
+  reg_ptr->setRegisterFile(this);
 }
 
 const std::map<int, Register *> &RegisterFile::getRegisters() const {
   return this->registers;
-}
-
-RegisterFileCluster *RegisterFile::getRegisterFileCluster() const {
-  return this->register_file_cluster;
 }
 
 //===----------------------------------------------------------------------===//
@@ -234,9 +245,13 @@ void RegisterFileCluster::setTile(Tile *tile) { this->tile = tile; }
 
 Tile *RegisterFileCluster::getTile() const { return this->tile; }
 
-void RegisterFileCluster::addRegisterFile(RegisterFile *register_file) {
-  register_files[register_file->getId()] = register_file;
-  register_file->setRegisterFileCluster(this);
+void RegisterFileCluster::addRegisterFile(
+    std::unique_ptr<RegisterFile> register_file) {
+  assert(register_file && "Cannot add null register file");
+  RegisterFile *register_file_ptr = register_file.get();
+  register_file_storage.push_back(std::move(register_file));
+  register_files[register_file_ptr->getId()] = register_file_ptr;
+  register_file_ptr->setRegisterFileCluster(this);
 }
 
 const std::map<int, RegisterFile *> &
@@ -265,29 +280,29 @@ void Architecture::initializeTiles(int per_cgra_rows, int per_cgra_columns) {
 void Architecture::createRegisterFileCluster(
     Tile *tile, int num_registers, int &num_already_assigned_global_registers,
     int global_id_start) {
-  const int k_num_regs_per_regfile = 8; // Keep this fixed for now.
-  const int k_num_regfiles_per_cluster = num_registers / k_num_regs_per_regfile;
+  const int kNumRegistersPerFile = 8; // Keep this fixed for now.
+  const int num_register_files = num_registers / kNumRegistersPerFile;
 
   // Ensures global register IDs are monotonically increasing.
   num_already_assigned_global_registers =
       std::max(num_already_assigned_global_registers, global_id_start);
 
-  RegisterFileCluster *register_file_cluster =
-      new RegisterFileCluster(tile->getId());
+  auto register_file_cluster =
+      std::make_unique<RegisterFileCluster>(tile->getId());
 
   // Creates registers as a register file.
-  int local_reg_id = 0;
-  for (int file_idx = 0; file_idx < k_num_regfiles_per_cluster; ++file_idx) {
-    RegisterFile *register_file = new RegisterFile(file_idx);
-    for (int reg = 0; reg < k_num_regs_per_regfile; ++reg) {
-      Register *new_register =
-          new Register(num_already_assigned_global_registers++, local_reg_id++);
-      register_file->addRegister(new_register);
+  int local_register_id = 0;
+  for (int file_index = 0; file_index < num_register_files; ++file_index) {
+    auto register_file = std::make_unique<RegisterFile>(file_index);
+    for (int register_index = 0; register_index < kNumRegistersPerFile;
+         ++register_index) {
+      register_file->addRegister(std::make_unique<Register>(
+          num_already_assigned_global_registers++, local_register_id++));
     }
-    register_file_cluster->addRegisterFile(register_file);
+    register_file_cluster->addRegisterFile(std::move(register_file));
   }
 
-  tile->addRegisterFileCluster(register_file_cluster);
+  tile->addRegisterFileCluster(std::move(register_file_cluster));
 }
 
 // Configures default tile settings.
@@ -311,40 +326,44 @@ void Architecture::configureDefaultTileSettings(
 // Applies tile overrides to modify specific tiles.
 void Architecture::applyTileOverrides(
     const std::vector<TileOverride> &tile_overrides) {
-  for (const auto &override : tile_overrides) {
+  for (const TileOverride &tile_override : tile_overrides) {
     Tile *tile = nullptr;
-    if (override.tile_x >= 0 && override.tile_y >= 0) {
+    if (tile_override.tile_x >= 0 && tile_override.tile_y >= 0) {
       // cloneWithNewDimensions() copies tile_overrides from the original
       // (larger) architecture and replays them on a smaller cloned grid.
       // An override may reference coordinates that exist in the original but
       // fall outside the cloned grid's bounds.  Skips such overrides rather
       // than asserting, so the clone only applies overrides that are relevant
       // to its own coordinate space.
-      auto it = coord_to_tile_.find({override.tile_x, override.tile_y});
-      if (it != coord_to_tile_.end())
-        tile = it->second;
+      auto found =
+          coord_to_tile_.find({tile_override.tile_x, tile_override.tile_y});
+      if (found != coord_to_tile_.end()) {
+        tile = found->second;
+      }
     }
 
     if (tile) {
       // Handles tile removal if existence is false.
-      if (!override.existence) {
+      if (!tile_override.existence) {
         removeTile(tile->getId());
         // Skips other overrides since tile is removed.
         continue;
       }
 
       // Overrides function unit types if specified.
-      if (!override.fu_types.empty()) {
-        configureTileFunctionUnits(tile, override.fu_types, true);
+      if (!tile_override.fu_types.empty()) {
+        configureTileFunctionUnits(tile, tile_override.fu_types, true);
       }
 
       // Overrides num_registers if specified.
-      if (override.num_registers > 0) {
+      if (tile_override.num_registers > 0) {
         // Creates new register file cluster with override capacity.
         // Note: addRegisterFileCluster handles deletion of existing cluster.
         // Uses tile ID as base to avoid conflicts with existing registers.
-        int dummy_ref = 0; // Not used when global_id_start is specified.
-        createRegisterFileCluster(tile, override.num_registers, dummy_ref,
+        // The running counter is unused when global_id_start is specified.
+        int ignored_global_register_counter = 0;
+        createRegisterFileCluster(tile, tile_override.num_registers,
+                                  ignored_global_register_counter,
                                   tile->getId() * 1000);
       }
     }
@@ -385,11 +404,6 @@ void Architecture::createLinks(const LinkDefaults &link_defaults,
   }
 }
 
-// Checks if a tile is on the boundary of the architecture.
-bool isTileOnBoundary(int x, int y, int rows, int columns) {
-  return (x == 0 || x == columns - 1 || y == 0 || y == rows - 1);
-}
-
 // Creates a link if the destination tile exists within bounds.
 void Architecture::createLinkIfValid(int &link_id, Tile *src_tile, int dst_x,
                                      int dst_y,
@@ -408,20 +422,20 @@ void Architecture::createLinkIfValid(int &link_id, Tile *src_tile, int dst_x,
 // Creates 4-connected mesh links (N, S, W, E).
 void Architecture::createMeshLinks(int &link_id,
                                    const LinkDefaults &link_defaults) {
-  for (int j = 0; j < getPerCgraRows(); ++j) {
-    for (int i = 0; i < getPerCgraColumns(); ++i) {
+  for (int y = 0; y < getPerCgraRows(); ++y) {
+    for (int x = 0; x < getPerCgraColumns(); ++x) {
       // Skips if tile was removed by tile_overrides.
-      auto it = coord_to_tile_.find({i, j});
-      if (it == coord_to_tile_.end()) {
+      auto found = coord_to_tile_.find({x, y});
+      if (found == coord_to_tile_.end()) {
         continue;
       }
-      Tile *tile = it->second;
+      Tile *tile = found->second;
 
       // Creates links to neighboring tiles with default properties.
-      createLinkIfValid(link_id, tile, i - 1, j, link_defaults); // West
-      createLinkIfValid(link_id, tile, i + 1, j, link_defaults); // East
-      createLinkIfValid(link_id, tile, i, j - 1, link_defaults); // South
-      createLinkIfValid(link_id, tile, i, j + 1, link_defaults); // North
+      createLinkIfValid(link_id, tile, x - 1, y, link_defaults); // West.
+      createLinkIfValid(link_id, tile, x + 1, y, link_defaults); // East.
+      createLinkIfValid(link_id, tile, x, y - 1, link_defaults); // South.
+      createLinkIfValid(link_id, tile, x, y + 1, link_defaults); // North.
     }
   }
 }
@@ -429,30 +443,30 @@ void Architecture::createMeshLinks(int &link_id,
 // Creates 8-connected king mesh links (N, S, W, E, NE, NW, SE, SW).
 void Architecture::createKingMeshLinks(int &link_id,
                                        const LinkDefaults &link_defaults) {
-  for (int j = 0; j < getPerCgraRows(); ++j) {
-    for (int i = 0; i < getPerCgraColumns(); ++i) {
+  for (int y = 0; y < getPerCgraRows(); ++y) {
+    for (int x = 0; x < getPerCgraColumns(); ++x) {
       // Skips if tile was removed by tile_overrides.
-      auto it = coord_to_tile_.find({i, j});
-      if (it == coord_to_tile_.end()) {
+      auto found = coord_to_tile_.find({x, y});
+      if (found == coord_to_tile_.end()) {
         continue;
       }
-      Tile *tile = it->second;
+      Tile *tile = found->second;
 
       // Creates 4-connected links (N, S, W, E).
-      createLinkIfValid(link_id, tile, i - 1, j, link_defaults); // West
-      createLinkIfValid(link_id, tile, i + 1, j, link_defaults); // East
-      createLinkIfValid(link_id, tile, i, j - 1, link_defaults); // South
-      createLinkIfValid(link_id, tile, i, j + 1, link_defaults); // North
+      createLinkIfValid(link_id, tile, x - 1, y, link_defaults); // West.
+      createLinkIfValid(link_id, tile, x + 1, y, link_defaults); // East.
+      createLinkIfValid(link_id, tile, x, y - 1, link_defaults); // South.
+      createLinkIfValid(link_id, tile, x, y + 1, link_defaults); // North.
 
       // Creates diagonal links for king mesh (NE, NW, SE, SW).
-      createLinkIfValid(link_id, tile, i - 1, j - 1,
-                        link_defaults); // Southwest
-      createLinkIfValid(link_id, tile, i + 1, j - 1,
-                        link_defaults); // Southeast
-      createLinkIfValid(link_id, tile, i - 1, j + 1,
-                        link_defaults); // Northwest
-      createLinkIfValid(link_id, tile, i + 1, j + 1,
-                        link_defaults); // Northeast
+      createLinkIfValid(link_id, tile, x - 1, y - 1,
+                        link_defaults); // Southwest.
+      createLinkIfValid(link_id, tile, x + 1, y - 1,
+                        link_defaults); // Southeast.
+      createLinkIfValid(link_id, tile, x - 1, y + 1,
+                        link_defaults); // Northwest.
+      createLinkIfValid(link_id, tile, x + 1, y + 1,
+                        link_defaults); // Northeast.
     }
   }
 }
@@ -461,36 +475,42 @@ void Architecture::createKingMeshLinks(int &link_id,
 void Architecture::createRingLinks(int &link_id,
                                    const LinkDefaults &link_defaults) {
   // Connects tiles on the outer boundary only.
-  for (int j = 0; j < getPerCgraRows(); ++j) {
-    for (int i = 0; i < getPerCgraColumns(); ++i) {
+  for (int y = 0; y < getPerCgraRows(); ++y) {
+    for (int x = 0; x < getPerCgraColumns(); ++x) {
       // Skips if tile was removed by tile_overrides.
-      auto it = coord_to_tile_.find({i, j});
-      if (it == coord_to_tile_.end()) {
+      auto found = coord_to_tile_.find({x, y});
+      if (found == coord_to_tile_.end()) {
         continue;
       }
-      Tile *tile = it->second;
+      Tile *tile = found->second;
 
-      // Checks if tile is on the boundary.
-      if (isTileOnBoundary(i, j, getPerCgraColumns(), getPerCgraRows())) {
+      // Checks if tile is on the boundary. The helper takes (x, y, rows,
+      // columns) and compares x against columns and y against rows, matching
+      // the (x, y) convention used everywhere in this file; passing
+      // (columns, rows) here transposed BOTH extents. The two transpositions
+      // cancel on a square array and do not on a rectangular one, where they
+      // silently declared real boundary tiles interior (and so left them
+      // without outgoing ring links).
+      if (isTileOnBoundary(x, y, getPerCgraRows(), getPerCgraColumns())) {
         // Creates connections only to adjacent boundary tiles.
-        createLinkIfValid(link_id, tile, i - 1, j, link_defaults); // West
-        createLinkIfValid(link_id, tile, i + 1, j, link_defaults); // East
-        createLinkIfValid(link_id, tile, i, j - 1, link_defaults); // South
-        createLinkIfValid(link_id, tile, i, j + 1, link_defaults); // North
+        createLinkIfValid(link_id, tile, x - 1, y, link_defaults); // West.
+        createLinkIfValid(link_id, tile, x + 1, y, link_defaults); // East.
+        createLinkIfValid(link_id, tile, x, y - 1, link_defaults); // South.
+        createLinkIfValid(link_id, tile, x, y + 1, link_defaults); // North.
       }
     }
   }
 }
 
-// Checks if a link already exists between two tiles.
-bool Architecture::linkExists(Tile *src_tile, Tile *dst_tile) {
+// Finds the link that carries src_tile -> dst_tile, or nullptr.
+Link *Architecture::findLink(Tile *src_tile, Tile *dst_tile) const {
   for (const auto &[id, link] : link_storage_) {
     if (link && link->getSrcTile() == src_tile &&
         link->getDstTile() == dst_tile) {
-      return true;
+      return link.get();
     }
   }
-  return false;
+  return nullptr;
 }
 
 // Applies link overrides to create, modify, or remove links.
@@ -501,27 +521,27 @@ void Architecture::applyLinkOverrides(
                          : link_storage_.rbegin()->first +
                                1; // Starts from the next available ID.
 
-  for (const auto &override : link_overrides) {
+  for (const LinkOverride &link_override : link_overrides) {
     // TODO: Recognize the CGRA coordinates for multi-cgra when manipulate the
     // link: https://github.com/coredac/dataflow/issues/163.
 
     // Handles existing link modifications/removals by coordinates of src/dst
     // tiles.
-    Link *link = getLink(override.src_tile_x, override.src_tile_y,
-                         override.dst_tile_x, override.dst_tile_y);
+    Link *link = getLink(link_override.src_tile_x, link_override.src_tile_y,
+                         link_override.dst_tile_x, link_override.dst_tile_y);
     // Handles link creation and override.
     if (link) {
-      if (override.latency > 0) {
-        link->setLatency(override.latency);
+      if (link_override.latency > 0) {
+        link->setLatency(link_override.latency);
       }
 
-      if (override.bandwidth > 0) {
-        link->setBandwidth(override.bandwidth);
+      if (link_override.bandwidth > 0) {
+        link->setBandwidth(link_override.bandwidth);
       }
 
-      if (!override.existence) {
-        removeLink(override.src_tile_x, override.src_tile_y,
-                   override.dst_tile_x, override.dst_tile_y);
+      if (!link_override.existence) {
+        removeLink(link_override.src_tile_x, link_override.src_tile_y,
+                   link_override.dst_tile_x, link_override.dst_tile_y);
       }
     }
     // Handles link removal.
@@ -531,37 +551,45 @@ void Architecture::applyLinkOverrides(
       // override may reference a tile that was not included in the clone.
       // Skip the override in that case to avoid a crash; the link simply
       // does not exist in the cloned architecture and needs no override.
-      auto src_it =
-          coord_to_tile_.find({override.src_tile_x, override.src_tile_y});
-      auto dst_it =
-          coord_to_tile_.find({override.dst_tile_x, override.dst_tile_y});
-      if (src_it == coord_to_tile_.end() || dst_it == coord_to_tile_.end())
+      auto src_it = coord_to_tile_.find(
+          {link_override.src_tile_x, link_override.src_tile_y});
+      auto dst_it = coord_to_tile_.find(
+          {link_override.dst_tile_x, link_override.dst_tile_y});
+      if (src_it == coord_to_tile_.end() || dst_it == coord_to_tile_.end()) {
         continue; // One or both tiles do not exist in this architecture.
+      }
       Tile *src_tile = src_it->second;
       Tile *dst_tile = dst_it->second;
 
       if (src_tile && dst_tile) {
-        bool link_already_exists = linkExists(src_tile, dst_tile);
+        bool link_already_exists = findLink(src_tile, dst_tile) != nullptr;
 
-        if (override.existence && !link_already_exists) {
-          // Creates new link.
-          auto link = std::make_unique<Link>(next_link_id++);
+        if (link_override.existence && !link_already_exists) {
+          // Creates new link. The storage KEY must equal the link's own id:
+          // removeLink(Tile*, Tile*) erases link_storage_[link->getId()], so a
+          // link filed under any other key can be unlinked from both tiles and
+          // still be handed out by getAllLinks() forever after. Previously the
+          // id was consumed by `next_link_id++` in the constructor and the
+          // entry then stored at `next_link_id` (= id + 1), with a second bump
+          // on top, so every override-created link was unremovable and the id
+          // space advanced twice per link.
+          auto link = std::make_unique<Link>(next_link_id);
 
           // Sets link properties.
-          if (override.latency > 0) {
-            link->setLatency(override.latency);
+          if (link_override.latency > 0) {
+            link->setLatency(link_override.latency);
           }
-          if (override.bandwidth > 0) {
-            link->setBandwidth(override.bandwidth);
+          if (link_override.bandwidth > 0) {
+            link->setBandwidth(link_override.bandwidth);
           }
 
           // Connects the tiles.
           link->connect(src_tile, dst_tile);
           link_storage_[next_link_id] = std::move(link);
           next_link_id++;
-        } else if (!override.existence && link_already_exists) {
-          removeLink(override.src_tile_x, override.src_tile_y,
-                     override.dst_tile_x, override.dst_tile_y);
+        } else if (!link_override.existence && link_already_exists) {
+          removeLink(link_override.src_tile_x, link_override.src_tile_y,
+                     link_override.dst_tile_x, link_override.dst_tile_y);
         }
       }
     }
@@ -613,12 +641,6 @@ std::unique_ptr<Architecture> Architecture::cloneWithNewDimensions(
       link_overrides_);
 }
 
-Tile *Architecture::getTile(int id) {
-  auto it = id_to_tile_.find(id);
-  assert(it != id_to_tile_.end() && "Tile with given ID not found");
-  return it->second;
-}
-
 Tile *Architecture::getTile(int x, int y) {
   auto it = coord_to_tile_.find({x, y});
   assert(it != coord_to_tile_.end() && "Tile with given coordinates not found");
@@ -637,6 +659,15 @@ std::vector<Tile *> Architecture::getAllTiles() const {
 
 int Architecture::getNumTiles() const {
   return static_cast<int>(id_to_tile_.size());
+}
+
+bool Architecture::canSupportCounter() const {
+  for (const auto &[id, tile] : this->tile_storage_) {
+    if (tile->canSupportOperation(OperationKind::ICounter)) {
+      return true;
+    }
+  }
+  return false;
 }
 
 // Removes a tile from the architecture.
@@ -674,18 +705,10 @@ Link *Architecture::getLink(int src_tile_x, int src_tile_y, int dst_tile_x,
                             int dst_tile_y) {
   auto src_it = coord_to_tile_.find({src_tile_x, src_tile_y});
   auto dst_it = coord_to_tile_.find({dst_tile_x, dst_tile_y});
-  if (src_it == coord_to_tile_.end() || dst_it == coord_to_tile_.end())
+  if (src_it == coord_to_tile_.end() || dst_it == coord_to_tile_.end()) {
     return nullptr; // One of the tiles does not exist.
-  Tile *src_tile = src_it->second;
-  Tile *dst_tile = dst_it->second;
-
-  for (const auto &[id, link] : link_storage_) {
-    if (link && link->getSrcTile() == src_tile &&
-        link->getDstTile() == dst_tile) {
-      return link.get();
-    }
   }
-  return nullptr;
+  return findLink(src_it->second, dst_it->second);
 }
 
 std::vector<Link *> Architecture::getAllLinks() const {
@@ -718,21 +741,17 @@ void Architecture::removeLink(int link_id) {
 }
 
 void Architecture::removeLink(Tile *src_tile, Tile *dst_tile) {
-
-  Link *link = nullptr;
-  for (auto it = link_storage_.begin(); it != link_storage_.end(); ++it) {
-    if (it->second && it->second->getSrcTile() == src_tile &&
-        it->second->getDstTile() == dst_tile) {
-      link = it->second.get();
-      break;
-    }
-  }
-
+  Link *link = findLink(src_tile, dst_tile);
   if (link) {
-    // Removes the link from both tiles' connection sets.
-    src_tile->unlinkDstTile(link, dst_tile);
-    // Removes the link from storage.
-    link_storage_.erase(link->getId());
+    // Delegates to the id overload so there is exactly ONE removal
+    // implementation: this overload used to unlink the tiles itself and then
+    // erase link_storage_[link->getId()] on its own, which is only the same
+    // entry as long as every link is filed under its own id. The assert pins
+    // that invariant down rather than leaving the two paths free to disagree.
+    assert(link_storage_.find(link->getId()) != link_storage_.end() &&
+           link_storage_.find(link->getId())->second.get() == link &&
+           "link storage key must equal the link id");
+    removeLink(link->getId());
   }
 }
 
@@ -740,16 +759,78 @@ void Architecture::removeLink(int src_tile_x, int src_tile_y, int dst_tile_x,
                               int dst_tile_y) {
   auto src_it = coord_to_tile_.find({src_tile_x, src_tile_y});
   auto dst_it = coord_to_tile_.find({dst_tile_x, dst_tile_y});
-  if (src_it == coord_to_tile_.end() || dst_it == coord_to_tile_.end())
+  if (src_it == coord_to_tile_.end() || dst_it == coord_to_tile_.end()) {
     return; // One of the tiles does not exist.
+  }
   removeLink(src_it->second, dst_it->second);
 }
 
-bool Architecture::canSupportCounter() const {
-  for (const auto &[id, tile] : this->tile_storage_) {
-    if (tile->canSupportOperation(OperationKind::ICounter)) {
-      return true;
+namespace mlir {
+namespace neura {
+
+// See the contract (and the removeTile()/existence=true explanation) in
+// Architecture.h.
+std::unique_ptr<Architecture>
+buildShapedArchitecture(const Architecture &global_arch, int x_tiles,
+                        int y_tiles, llvm::StringRef valid_tiles,
+                        llvm::StringRef diag_tag) {
+  if (x_tiles <= 0 || y_tiles <= 0) {
+    return nullptr;
+  }
+
+  std::vector<TileOverride> overrides;
+  if (!valid_tiles.empty()) {
+    // applyTileOverrides can only REMOVE tiles (existence=false); it cannot
+    // re-add a removed tile. So emit a removal override for every tile NOT in
+    // the valid set, and leave the valid tiles untouched.
+    std::set<std::pair<int, int>> valid_coords;
+    llvm::SmallVector<llvm::StringRef, 4> coords;
+    valid_tiles.split(coords, ',');
+    for (llvm::StringRef coord : coords) {
+      coord = coord.trim(); // tolerate "0_0, 1_1" with spaces after commas.
+      if (coord.empty()) {
+        continue;
+      }
+      auto parts = coord.split('_');
+      int x, y;
+      if (!parts.first.trim().getAsInteger(10, x) &&
+          !parts.second.trim().getAsInteger(10, y)) {
+        // Ignore out-of-grid coords rather than silently removing real tiles.
+        if (x >= 0 && x < x_tiles && y >= 0 && y < y_tiles) {
+          valid_coords.insert({x, y});
+        } else {
+          llvm::errs() << diag_tag << " valid-tiles coord " << x << "_" << y
+                       << " is outside the " << x_tiles << "x" << y_tiles
+                       << " grid; ignored\n";
+        }
+      }
+    }
+    if (valid_coords.empty()) {
+      // Every tile would be removed -> a 0-tile arch, whose predictions and
+      // mappings are meaningless. Fall back to the full rectangle and warn.
+      llvm::errs() << diag_tag
+                   << " valid-tiles selected no tiles in the grid; using the "
+                      "full "
+                   << x_tiles << "x" << y_tiles << " rectangle\n";
+    } else {
+      for (int y = 0; y < y_tiles; ++y) {
+        for (int x = 0; x < x_tiles; ++x) {
+          if (!valid_coords.count({x, y})) {
+            TileOverride tile_override;
+            tile_override.tile_x = x;
+            tile_override.tile_y = y;
+            tile_override.existence = false;
+            overrides.push_back(tile_override);
+          }
+        }
+      }
     }
   }
-  return false;
+
+  // Tiles marked existence=false are removed before inter-tile links are
+  // created, so no boundary link connects to an absent tile.
+  return global_arch.cloneWithNewDimensions(y_tiles, x_tiles, overrides);
 }
+
+} // namespace neura
+} // namespace mlir

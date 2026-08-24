@@ -1,5 +1,8 @@
 #include <deque>
 #include <queue>
+#include <set>
+#include <tuple>
+#include <vector>
 
 #include "NeuraDialect/Mapping/mapping_util.h"
 #include "NeuraDialect/NeuraOps.h"
@@ -65,6 +68,8 @@ OperationKind getOperationKindFromMlirOp(Operation *op) {
   // Logical operations
   if (isa<neura::OrOp>(op))
     return IOr;
+  if (isa<neura::AndOp>(op))
+    return IAnd;
   if (isa<neura::NotOp>(op))
     return INot;
   if (isa<neura::ICmpOp>(op))
@@ -97,7 +102,17 @@ OperationKind getOperationKindFromMlirOp(Operation *op) {
   // Control flow operations
   if (isa<neura::ReturnOp>(op))
     return IReturn;
+  // The dataflow-mode returns are the same return FU as neura.return; they are
+  // not terminators, so they are placed like any other op.
+  if (isa<neura::ReturnVoidOp>(op))
+    return IReturn;
+  if (isa<neura::ReturnValueOp>(op))
+    return IReturn;
   if (isa<neura::PhiOp>(op))
+    return IPhi;
+  // phi_start is the loop-initialisation phi (init value + reserve), so it runs
+  // on the same phi FU as a general phi merge.
+  if (isa<neura::PhiStartOp>(op))
     return IPhi;
 
   // Data movement operations
@@ -124,8 +139,32 @@ OperationKind getOperationKindFromMlirOp(Operation *op) {
   if (isa<neura::ConstantOp>(op))
     return IConstant;
 
-  // Default fallback
-  return IAdd;
+  // Counter operations
+  if (isa<neura::CounterOp>(op))
+    return ICounter;
+  if (isa<neura::ExtractPredicateOp>(op))
+    return IExtractPredicate;
+
+  // Anything else has no FU class in kFuTypesToOperations, so it is reported as
+  // unknown rather than silently claiming to be an adder. Unknown is treated as
+  // UNCONSTRAINED everywhere (fuClassOf -> "other" -> every tile), never as
+  // infeasible -- see IUnknown in Architecture.h and tileCanRunOp below.
+  //
+  // Deliberately NOT enumerated here, even though a plausible kind exists:
+  //   - neura.memset / neura.gather. IStore / ILoadIndexed would be defensible,
+  //     but "mem" and "mem_indexed" are scarce on the pruned specs (7 of 16
+  //     tiles on test/arch_spec/architecture.yaml), so claiming them would move
+  //     currently-passing placements and add these ops to MemMII. That is a
+  //     modelling decision about what a memset costs, not a fix to a
+  //     mislabelled FU, so it is left out of this change.
+  //   - neura.carry / merge / invariant (ICarryInvariant / IConditionalSelect /
+  //     IInvariantGroup exist in the enum but no FU class lists them), and
+  //     neura.true_steer / false_steer / fmax / fmin / mul_add / vadd / vmul /
+  //     vfadd / fneg / gep, which have no OperationKind at all. Every one of
+  //     these resolves to "other" whether or not it gets an arm here, so the
+  //     arm would add nothing today and would silently become a placement
+  //     constraint the day someone adds the kind to kFuTypesToOperations.
+  return IUnknown;
 }
 
 // Returns true if the operation does not need CGRA tile placement.
@@ -162,16 +201,6 @@ bool occupiesFU(Operation *op) {
   return true;
 }
 
-std::vector<Operation *> collectPlacedOps(Region &region) {
-  std::vector<Operation *> placed_ops;
-  region.walk([&](Operation *operation) {
-    if (occupiesFU(operation)) {
-      placed_ops.push_back(operation);
-    }
-  });
-  return placed_ops;
-}
-
 // Inverse of Architecture's kFuTypesToOperations: OperationKind -> FU class
 // name. Built once, lazily.
 static const std::map<OperationKind, std::string> &kindToFuClassTable() {
@@ -187,6 +216,24 @@ static const std::map<OperationKind, std::string> &kindToFuClassTable() {
   return table;
 }
 
+// Whether `tile` can run `op`, as the mapper's tile filter needs it.
+//
+// Distinct from Tile::canSupportOperation(getOperationKindFromMlirOp(op)): an
+// op whose kind no FU class describes (IUnknown, or one of the enum kinds
+// absent from kFuTypesToOperations, e.g. ICarryInvariant) is UNCONSTRAINED and
+// runs anywhere, whereas canSupportOperation answers "no" for every tile and
+// the mapper then aborts with "not supported by any tile". This is the same
+// unknown-means-unconstrained rule tilesProvidingFuClass applies -- see the
+// header -- and it is what kept neura.carry / mul_add / vadd mappable back when
+// the kind lookup fell through to IAdd.
+static bool tileCanRunOp(const Tile *tile, Operation *op) {
+  OperationKind kind = getOperationKindFromMlirOp(op);
+  if (!kindToFuClassTable().count(kind)) {
+    return true;
+  }
+  return tile->canSupportOperation(kind);
+}
+
 std::string fuClassOf(Operation *op) {
   // A fused op is placed as its whole pattern, so its class is the pattern
   // name.
@@ -198,6 +245,117 @@ std::string fuClassOf(Operation *op) {
   }
   auto found = kindToFuClassTable().find(getOperationKindFromMlirOp(op));
   return found == kindToFuClassTable().end() ? "other" : found->second;
+}
+
+llvm::SmallVector<Tile *, 16> tilesProvidingFuClass(const Architecture &arch,
+                                                    llvm::StringRef fu_class) {
+  llvm::SmallVector<Tile *, 16> tiles;
+  auto found = kFuTypesToOperations.find(fu_class.str());
+  if (found == kFuTypesToOperations.end() || found->second.empty()) {
+    // Nothing is known about this class, so nothing constrains it: every tile
+    // is a candidate. See the header -- this is NOT the same answer as "no tile
+    // provides it", which is an empty list.
+    for (Tile *tile : arch.getAllTiles()) {
+      tiles.push_back(tile);
+    }
+    return tiles;
+  }
+  // Every OperationKind in a class is provided by the same FU, so one probe
+  // kind decides the whole class.
+  OperationKind probe_kind = found->second.front();
+  for (Tile *tile : arch.getAllTiles()) {
+    if (tile->canSupportOperation(probe_kind)) {
+      tiles.push_back(tile);
+    }
+  }
+  return tiles;
+}
+
+std::vector<Operation *> collectPlacedOps(Region &region) {
+  std::vector<Operation *> placed_ops;
+  region.walk([&](Operation *op) {
+    if (occupiesFU(op)) {
+      placed_ops.push_back(op);
+    }
+  });
+  return placed_ops;
+}
+
+Operation *getPlacedProducer(Value value) {
+  Operation *producer = value.getDefiningOp();
+  if (!producer) {
+    return nullptr;
+  }
+  if (isa<neura::ReserveOp>(producer)) {
+    return nullptr; // Loop-carried placeholder; handled via ctrl_mov edges.
+  }
+  if (auto move = dyn_cast<neura::DataMovOp>(producer)) {
+    Operation *inner_producer = move.getOperand().getDefiningOp();
+    if (inner_producer && !isa<neura::ReserveOp>(inner_producer)) {
+      return inner_producer;
+    }
+    return nullptr;
+  }
+  return producer;
+}
+
+std::vector<DependenceEdge>
+buildDfgEdges(Region &region, const std::vector<Operation *> &placed_ops) {
+  llvm::DenseMap<Operation *, int> op_id;
+  for (int index = 0; index < (int)placed_ops.size(); ++index) {
+    op_id[placed_ops[index]] = index;
+  }
+
+  std::vector<DependenceEdge> edges;
+  // (src, dst, omega) already emitted. An edge's delay is its source's latency,
+  // so this triple identifies the whole edge and any repeat is an exact
+  // duplicate of one dependence net.
+  std::set<std::tuple<int, int, int>> seen;
+  auto addEdge = [&](int src, int dst, int omega) {
+    if (seen.insert({src, dst, omega}).second) {
+      edges.push_back(DependenceEdge{src, dst, omega});
+    }
+  };
+
+  // Forward (intra-iteration) edges, omega=0.
+  for (Operation *consumer : placed_ops) {
+    auto consumer_id = op_id.find(consumer);
+    for (Value operand : consumer->getOperands()) {
+      Operation *producer = getPlacedProducer(operand);
+      auto producer_id = producer ? op_id.find(producer) : op_id.end();
+      if (producer_id != op_id.end()) {
+        addEdge(producer_id->second, consumer_id->second, 0);
+      }
+    }
+  }
+
+  // Loop-carried edges, omega=1: the producer of a ctrl_mov's value -> the
+  // placed users of the reserve it targets. Represents value[i] feeding the
+  // placeholder for iteration i+1.
+  region.walk([&](neura::CtrlMovOp ctrl_mov) {
+    Operation *producer = getPlacedProducer(ctrl_mov.getValue());
+    auto reserve = ctrl_mov.getTarget().getDefiningOp<neura::ReserveOp>();
+    auto producer_id = producer ? op_id.find(producer) : op_id.end();
+    if (producer_id == op_id.end() || !reserve) {
+      return;
+    }
+    for (Operation *user : reserve.getResult().getUsers()) {
+      Operation *placed_user = user;
+      if (is_non_materialized(user)) {
+        for (Operation *router_user : user->getUsers()) {
+          if (op_id.count(router_user)) {
+            placed_user = router_user;
+          }
+        }
+      }
+      auto user_id = op_id.find(placed_user);
+      if (user_id != op_id.end()) {
+        addEdge(producer_id->second, user_id->second, 1);
+      }
+    }
+  });
+
+  return edges;
 }
 
 } // namespace neura
@@ -294,21 +452,27 @@ mlir::neura::collectRecurrenceCycles(Region &region) {
 
 int mlir::neura::calculateResourceMii(Region &region,
                                       const Architecture &architecture) {
+  // Counts exactly the ops that occupy a tile/FU. This MUST be occupiesFU and
+  // not a hand-rolled isa<> list: the number divided here is a count of tile
+  // issue slots, so it has to be the same set the mapper actually places --
+  // HeuristicMapping filters its worklist with !is_non_materialized, and
+  // collectPlacedOps/--dump-dfg-json/--import-mapping all filter with
+  // occupiesFU.
+  //
+  // The list that used to live here omitted neura::YieldOp, so it counted one
+  // op per kernel body that no tile ever runs. neura.yield is a Terminator /
+  // Pure / ReturnLike region terminator: it names the values leaving a
+  // kernel/fused_op region, the mapper never assigns it a mapping_locs, and
+  // GenerateCodePass skips it when building the DFG, so it emits no
+  // instruction. Counting it inflated this floor by ceil(1/tiles) and made the
+  // mapper start its search one II above the cost model's ResourceMII on the
+  // same region. Both values now use the same name because they are the same
+  // FU-agnostic tile-slot bound and must be kept equal by construction.
   int num_ops = 0;
-
-  // Count all "compute" operations (non-terminators, non-block ops).
   region.walk([&](Operation *op) {
-    // Skips non-materialized ops.
-    if (isa<func::FuncOp>(op) ||
-        isa<neura::CtrlMovOp, neura::DataMovOp, neura::ReserveOp>(op)) {
-      return;
+    if (occupiesFU(op)) {
+      ++num_ops;
     }
-    // Skips operations inside fused_op regions
-    Operation *parent_op = op->getParentOp();
-    if (isa<neura::FusedOp>(parent_op)) {
-      return;
-    }
-    ++num_ops;
   });
 
   llvm::errs() << "[calculateResourceMii] Total operations: " << num_ops
@@ -1049,7 +1213,7 @@ mlir::neura::calculateAward(Operation *op, std::set<Operation *> &critical_ops,
   // Early exit if the operation is not supported by all the tiles.
   bool op_can_be_supported = false;
   for (Tile *tile : architecture.getAllTiles()) {
-    if (tile->canSupportOperation(getOperationKindFromMlirOp(op))) {
+    if (tileCanRunOp(tile, op)) {
       op_can_be_supported = true;
     }
   }
@@ -1092,7 +1256,7 @@ mlir::neura::calculateAward(Operation *op, std::set<Operation *> &critical_ops,
                << "; Producers: " << producers.size() << "\n";
 
   for (Tile *tile : architecture.getAllTiles()) {
-    if (!tile->canSupportOperation(getOperationKindFromMlirOp(op))) {
+    if (!tileCanRunOp(tile, op)) {
       llvm::errs() << "[calculateAward] Tile<" << tile->getX() << ", "
                    << tile->getY() << "> does not support operation: " << *op
                    << "\n";

@@ -3,10 +3,19 @@
 #include "NeuraDialect/Architecture/Architecture.h"
 #include "NeuraDialect/Mapping/MappingState.h"
 #include "mlir/IR/Operation.h"
+#include "llvm/ADT/SmallVector.h"
+#include "llvm/ADT/StringRef.h"
 
 namespace mlir {
 namespace neura {
-// Returns the kind of operation from the MLIR operation.
+// Returns the kind of operation from the MLIR operation, or IUnknown when the
+// op has no modelled functional unit. IUnknown is NOT a member of any FU class,
+// so fuClassOf reports "other" for it and every consumer must treat it as
+// unconstrained (runs on any tile), never as infeasible. It used to fall
+// through to IAdd, which made ~20 op kinds -- counter, phi_start, and,
+// return_value, extract_predicate, carry, merge, invariant, the steers, fmax /
+// fmin, mul_add, the vector ops, memset, gather -- claim the adder class and be
+// priced against the adder capacity.
 OperationKind getOperationKindFromMlirOp(Operation *op);
 
 // Returns true if the operation does not need CGRA tile placement.
@@ -22,15 +31,65 @@ bool is_non_materialized(Operation *op);
 // indices stay aligned.
 bool occupiesFU(Operation *op);
 
-// The operations placed by the mapper, in deterministic region-walk order.
-// This ordering is shared by DFG export and exact-mapping import.
-std::vector<Operation *> collectPlacedOps(Region &region);
-
 // FU class name an op maps to (the inverse of Architecture's
 // kFuTypesToOperations). A fused op reports its pattern_name (or "fused" if it
 // carries none); an op with no known class reports "other". Shared by the
 // analytical cost model and --dump-dfg-json so both bucket ops identically.
 std::string fuClassOf(Operation *op);
+
+// Tiles that physically provide `fu_class`.
+//
+// A class the FU table does not describe (absent, or present with no
+// OperationKinds) is UNCONSTRAINED: every tile is returned, because nothing is
+// known about which FU would run it. A class the table DOES describe but that
+// no tile provides returns EMPTY -- that is a real capacity of zero, i.e. the
+// op cannot be placed anywhere on this architecture. The two cases are
+// deliberately distinct, and --dump-dfg-json mirrors them: it emits no key for
+// an undescribed class (so the exact mapper's `fu_class_tiles.get(c, all)`
+// falls back to every tile) and an empty list for a described-but-unprovided
+// one. Single source of truth for the analytical cost model, --dump-dfg-json
+// and anything else that asks "how many tiles can run this class".
+llvm::SmallVector<Tile *, 16> tilesProvidingFuClass(const Architecture &arch,
+                                                    llvm::StringRef fu_class);
+
+// The placed ops of `region`, in the order --dump-dfg-json emits them.
+//
+// THIS ORDER IS A CONTRACT: op index i in the emitted JSON is placed_ops[i]
+// here, and --import-mapping replays the solver's placements onto exactly this
+// sequence. It is the region walk order filtered by occupiesFU; do not sort,
+// filter or otherwise reorder it.
+std::vector<Operation *> collectPlacedOps(Region &region);
+
+// The placed producer of `value` as the dependence graph sees it: unwraps one
+// data_mov to the op that really produced the value, and returns null for a
+// reserve (the loop-carried placeholder, which the omega=1 edges carry
+// instead). Non-asserting counterpart of getMaterializedProducer.
+Operation *getPlacedProducer(Value value);
+
+// One dependence edge over collectPlacedOps indices. `omega` is the iteration
+// distance: 0 for an intra-iteration operand edge, 1 for a loop-carried
+// ctrl_mov/reserve edge.
+struct DependenceEdge {
+  int src;
+  int dst;
+  int omega;
+};
+
+// The dependence edges over `placed_ops` (which must come from
+// collectPlacedOps on the same region): forward operand edges with omega=0
+// plus ctrl_mov/reserve back edges with omega=1.
+//
+// Edges are de-duplicated on (src, dst, omega). An op that reads the same
+// value twice (`x + x`) has two data_movs to one producer, but that is ONE
+// dependence net -- one value, one route -- and since an edge's delay is a
+// function of its source alone, the repeats are identical records. Emitting
+// them twice would double-book the shared link on import, and would put
+// parallel arcs in the cost model's recurrence graph that cannot change its
+// maximum cycle ratio. Shared by --dump-dfg-json (which hands these edges to
+// the exact mapper) and the analytical RecMII, so both reason about the same
+// graph.
+std::vector<DependenceEdge>
+buildDfgEdges(Region &region, const std::vector<Operation *> &placed_ops);
 
 // Returns true if the operation is a steering-mode operation that doesn't
 // require DataMovOp wrapping (e.g., constants, carry, invariant, etc.).
@@ -52,7 +111,14 @@ struct RecurrenceCycle {
 // Collects recurrence cycles rooted at reserve and closed by ctrl_mov.
 SmallVector<RecurrenceCycle, 4> collectRecurrenceCycles(Region &region);
 
-// Calculates ResourceMII: ceil(#ops / #tiles).
+// Calculates ResourceMII: ceil(#ops / #tiles), where #ops counts exactly the
+// ops satisfying occupiesFU -- the same set the mapper places. This is
+// numerically identical to the cost model's ResourceMII bound (see
+// calculateResourceMiiBound in analytical_cost_model.h) on the same region and
+// tile count; the two are
+// deliberately one formula over one predicate, so the mapper's starting II
+// floor and the analytical floor can never disagree. If you change the op
+// filter, change occupiesFU, not this function.
 int calculateResourceMii(Region &region, const Architecture &architecture);
 
 // Returns topologically sorted operations in region.

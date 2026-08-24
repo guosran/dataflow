@@ -24,9 +24,6 @@
 #include "llvm/ADT/StringRef.h"
 #include "llvm/Support/raw_ostream.h"
 
-#include <set>
-#include <utility>
-
 using namespace mlir;
 using namespace mlir::neura;
 
@@ -77,94 +74,40 @@ struct CostModelAnalyticalPass
       llvm::cl::desc("Record analytical_ii and bounds in an attribute."),
       llvm::cl::init(true)};
 
-  // Builds the target architecture, honouring x/y-tiles + valid-tiles exactly
-  // like --map-to-accelerator so predictions can be compared per CGRA shape.
-  std::unique_ptr<Architecture>
-  buildCustomArch(const Architecture &global_arch) {
-    if (x_tiles.getValue() <= 0 || y_tiles.getValue() <= 0) {
-      return nullptr;
-    }
-    std::vector<TileOverride> overrides;
-    if (!valid_tiles.getValue().empty()) {
-      // applyTileOverrides can only REMOVE tiles (existence=false), not re-add
-      // them; so remove every tile NOT in the valid set, leaving valid ones.
-      std::set<std::pair<int, int>> valid_coords;
-      llvm::SmallVector<llvm::StringRef, 4> coords;
-      llvm::StringRef(valid_tiles.getValue()).split(coords, ',');
-      for (llvm::StringRef coord : coords) {
-        coord = coord.trim(); // tolerate "0_0, 1_1" with spaces after commas.
-        if (coord.empty()) {
-          continue;
-        }
-        auto parts = coord.split('_');
-        int x, y;
-        if (!parts.first.trim().getAsInteger(10, x) &&
-            !parts.second.trim().getAsInteger(10, y)) {
-          // Ignore coords outside the x/y-tiles grid rather than letting a typo
-          // silently remove real tiles.
-          if (x >= 0 && x < x_tiles.getValue() && y >= 0 &&
-              y < y_tiles.getValue()) {
-            valid_coords.insert({x, y});
-          } else {
-            llvm::errs() << "[cost-model-analytical] valid-tiles coord " << x
-                         << "_" << y << " is outside the " << x_tiles.getValue()
-                         << "x" << y_tiles.getValue() << " grid; ignored\n";
-          }
-        }
-      }
-      if (valid_coords.empty()) {
-        // Every valid tile would be removed -> a 0-tile arch, whose predictions
-        // are meaningless. Fall back to the full rectangle and warn.
-        llvm::errs() << "[cost-model-analytical] valid-tiles selected no tiles "
-                        "in the grid; using the full "
-                     << x_tiles.getValue() << "x" << y_tiles.getValue()
-                     << " rectangle\n";
-      } else {
-        for (int y = 0; y < y_tiles.getValue(); ++y) {
-          for (int x = 0; x < x_tiles.getValue(); ++x) {
-            if (!valid_coords.count({x, y})) {
-              TileOverride tile_override;
-              tile_override.tile_x = x;
-              tile_override.tile_y = y;
-              tile_override.existence = false;
-              overrides.push_back(tile_override);
-            }
-          }
-        }
-      }
-    }
-    return global_arch.cloneWithNewDimensions(y_tiles.getValue(),
-                                              x_tiles.getValue(), overrides);
-  }
-
   void writeAttr(Operation *op, const AnalyticalIIBreakdown &breakdown) {
-    MLIRContext *ctx = op->getContext();
-    auto i32 = [&](int value) {
-      return IntegerAttr::get(IntegerType::get(ctx, 32), value);
+    MLIRContext *context = op->getContext();
+    auto makeI32Attr = [&](int value) {
+      return IntegerAttr::get(IntegerType::get(context, 32), value);
     };
     SmallVector<NamedAttribute, 10> attrs;
-    auto add = [&](StringRef key, Attribute value) {
-      attrs.push_back(NamedAttribute(StringAttr::get(ctx, key), value));
+    auto addAttr = [&](StringRef key, Attribute value) {
+      attrs.push_back(NamedAttribute(StringAttr::get(context, key), value));
     };
-    add("analytical_ii", i32(breakdown.final_ii));
-    add("compute_mii", i32(breakdown.compute.value));
-    add("rec_mii", i32(breakdown.rec.value));
-    add("mem_mii", i32(breakdown.mem.value));
-    add("route_mii", i32(breakdown.route.value));
-    add("reg_mii", i32(breakdown.reg.value));
-    add("res_mii", i32(breakdown.resource.value));
-    add("max_ii", i32(breakdown.max_ii));
-    add("dominant", StringAttr::get(ctx, breakdown.dominant));
-    op->setAttr(kAnalyticalAttr, DictionaryAttr::get(ctx, attrs));
+    addAttr("analytical_ii", makeI32Attr(breakdown.final_ii));
+    addAttr("compute_mii", makeI32Attr(breakdown.compute.value));
+    addAttr("rec_mii", makeI32Attr(breakdown.rec.value));
+    addAttr("mem_mii", makeI32Attr(breakdown.mem.value));
+    addAttr("route_mii", makeI32Attr(breakdown.route.value));
+    addAttr("reg_mii", makeI32Attr(breakdown.reg.value));
+    addAttr("res_mii", makeI32Attr(breakdown.resource.value));
+    addAttr("max_ii", makeI32Attr(breakdown.max_ii));
+    addAttr("dominant", StringAttr::get(context, breakdown.dominant));
+    op->setAttr(kAnalyticalAttr, DictionaryAttr::get(context, attrs));
   }
 
   void runOnOperation() override {
     ModuleOp module = getOperation();
     const Architecture &global_arch = mlir::neura::getArchitecture();
-    std::unique_ptr<Architecture> custom = buildCustomArch(global_arch);
-    const Architecture &arch = custom ? *custom : global_arch;
+    // Honours x/y-tiles + valid-tiles exactly like --map-to-accelerator, so
+    // predictions can be compared per CGRA shape: buildShapedArchitecture IS
+    // what --map-to-accelerator calls, rather than a duplicated parser.
+    std::unique_ptr<Architecture> shaped_arch = buildShapedArchitecture(
+        global_arch, x_tiles.getValue(), y_tiles.getValue(),
+        valid_tiles.getValue(), "[cost-model-analytical]");
+    const Architecture &arch = shaped_arch ? *shaped_arch : global_arch;
 
     int num_processed = 0;
+    bool found_infeasible_region = false;
     auto process = [&](Operation *op, Region &region, StringRef name) {
       if (region.empty()) {
         return;
@@ -173,18 +116,25 @@ struct CostModelAnalyticalPass
       llvm::errs() << "[cost-model-analytical] region=" << name
                    << " tiles=" << arch.getNumTiles() << "\n";
       breakdown.print(llvm::errs());
+      if (breakdown.infeasible) {
+        op->emitError() << "analytical cost model is infeasible: "
+                        << breakdown.compute.detail << "; "
+                        << breakdown.mem.detail;
+        found_infeasible_region = true;
+        return;
+      }
       if (write_attr.getValue()) {
         writeAttr(op, breakdown);
       }
       ++num_processed;
     };
 
-    bool any_accel = false;
+    bool has_accelerator_region = false;
     module.walk([&](neura::KernelOp kernel) {
       auto accel_attr =
           kernel->getAttrOfType<StringAttr>(accel::kAcceleratorAttr);
       if (accel_attr && accel_attr.getValue() == accel::kNeuraTarget) {
-        any_accel = true;
+        has_accelerator_region = true;
         process(kernel, kernel.getBody(), "kernel");
       }
     });
@@ -192,7 +142,7 @@ struct CostModelAnalyticalPass
       auto accel_attr =
           func->getAttrOfType<StringAttr>(accel::kAcceleratorAttr);
       if (accel_attr && accel_attr.getValue() == accel::kNeuraTarget) {
-        any_accel = true;
+        has_accelerator_region = true;
         process(func, func.getBody(), func.getName());
       }
     });
@@ -200,7 +150,7 @@ struct CostModelAnalyticalPass
     // Fallback: no op is explicitly tagged for the accelerator (e.g. a
     // hand-written regression kernel). Process every non-empty func so the
     // model is still usable standalone.
-    if (!any_accel) {
+    if (!has_accelerator_region) {
       module.walk([&](func::FuncOp func) {
         process(func, func.getBody(), func.getName());
       });
@@ -208,6 +158,9 @@ struct CostModelAnalyticalPass
 
     if (num_processed == 0) {
       llvm::errs() << "[cost-model-analytical] no regions processed\n";
+    }
+    if (found_infeasible_region) {
+      signalPassFailure();
     }
   }
 };

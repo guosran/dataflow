@@ -35,6 +35,10 @@ struct IIBound {
   long long demand = 0;   // numerator (work / accesses / moves / live vals).
   long long capacity = 1; // denominator (FU count / ports / links / regs).
   std::string detail;     // human-readable dominant sub-term (e.g. FU class).
+  // Capacity is genuinely ZERO: the kernel needs an FU class that no tile on
+  // this architecture provides, so no II makes it mappable. The analytical
+  // pass reports this as a diagnostic failure rather than producing an II.
+  bool infeasible = false;
 };
 
 // Full per-bound breakdown of the analytical II prediction for one region.
@@ -46,27 +50,31 @@ struct AnalyticalIIBreakdown {
   IIBound reg; // RegMII   — simultaneously-live values vs register capacity.
   IIBound resource; // ResourceMII — tile issue-slot occupancy.
 
-  int final_ii = 1;     // clamp(max(all bounds), 1, max_ii).
-  int max_ii = 0;       // architecture II ceiling (ctrl_mem_items).
+  int final_ii = 1; // clamp(max(sound bounds), 1, max_ii). Never over-predicts.
+  int max_ii = 0;   // architecture II ceiling (ctrl_mem_items).
   bool clamped = false; // true if max(bounds) exceeded max_ii.
+  // True if some bound reported capacity zero (an FU class no tile provides).
+  // The kernel does not map on this architecture at any II. `final_ii` is zero,
+  // and the analytical pass reports a diagnostic failure rather than writing a
+  // result attribute.
+  bool infeasible = false;
   std::string dominant; // name of the largest-demand bound (== final_ii unless
                         // clamped to max_ii).
-
   // Prints the structured diagnostic block:
   //   [cost-model-analytical]
   //   compute_mii=.. rec_mii=.. mem_mii=.. route_mii=.. reg_mii=..
-  //   res_mii=.. final_ii=..  (dominant=..)
-  void print(llvm::raw_ostream &os) const;
+  //   res_mii=..
+  //   final_ii=..  (dominant=..)
+  void print(llvm::raw_ostream &output_stream) const;
 };
 
-// ===-- Individual bounds (each independently testable) --===================
-// //
+//===-- Individual bounds (each independently testable) -------------------===//
 
 // ComputeMII: partitions placed ops by FU class (add/mul/mem/cmp/... per
 // kFuTypesToOperations), weights each by its execution latency, and divides by
 // the number of tiles that physically provide that FU class.
-//   ComputeMII = max_class ceil( sum_latency(class) / #tiles_supporting(class)
-//   )
+//   ComputeMII = max_class ceil( sum_latency(class) /
+//                                #tiles_supporting(class) )
 IIBound calculateComputeMiiPerClass(Region &region, const Architecture &arch);
 
 // RecMII: for every loop-carried recurrence cycle (reserve -> ... -> ctrl_mov),
@@ -95,6 +103,11 @@ IIBound calculateRegMii(Region &region, const Architecture &arch);
 // bandwidth (1 issue / tile / cycle here). Coincides with the crude
 // ceil(#ops / #tiles) baseline and is kept separate so multi-issue tiles are
 // expressible.
+//
+// Equal by construction to neura::calculateResourceMii (mapping_util.h), which
+// the mapper uses for its starting II floor: both count occupiesFU ops over
+// arch.getNumTiles(). Anything that would make them differ is a bug in one of
+// them -- keep the single predicate rather than two lists kept in step.
 IIBound calculateResourceMiiBound(Region &region, const Architecture &arch);
 
 // Computes all bounds and combines them into the final prediction.

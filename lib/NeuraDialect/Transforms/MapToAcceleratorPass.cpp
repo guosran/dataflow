@@ -1,6 +1,8 @@
 #include <deque>
 #include <fstream>
 #include <memory>
+#include <set>
+#include <utility>
 
 #include "Common/AcceleratorAttrs.h"
 #include "NeuraDialect/Architecture/Architecture.h"
@@ -19,6 +21,10 @@
 #include "mlir/Pass/Pass.h"
 #include "mlir/Transforms/GreedyPatternRewriteDriver.h"
 #include "llvm/ADT/DenseMap.h"
+#include "llvm/ADT/DenseSet.h"
+#include "llvm/ADT/STLExtras.h"
+#include "llvm/ADT/SmallVector.h"
+#include "llvm/ADT/StringMap.h"
 #include "llvm/ADT/StringRef.h"
 #include "llvm/Support/JSON.h"
 #include "llvm/Support/MemoryBuffer.h"
@@ -225,6 +231,76 @@ struct MapToAcceleratorPass
   // them instead of greedily re-routing.
   using RouteMap = std::map<std::pair<int, int>, std::vector<RouteHop>>;
 
+  // Rejects an imported placement that binds an op to a tile whose functional
+  // units cannot run it.
+  //
+  // The internal mapper never even considers such a location: its candidate
+  // filter (mapping_util) drops every tile that does not provide the op's FU.
+  // The import path used to skip that filter entirely and bind whatever the
+  // JSON said, so an external solver that models FU classes differently -- or a
+  // JSON that is simply stale with respect to the architecture spec -- produced
+  // a mapping the hardware cannot execute while the compiler still reported
+  // success (mapping_strategy = "exact-cpsat", a compiled_ii, generated code).
+  // Since --import-mapping exists to REPLAY an oracle so its II can be
+  // measured, that silent acceptance turns straight into a fabricated result;
+  // failing is the only safe answer.
+  //
+  // Legality is asked through tilesProvidingFuClass(fuClassOf(op)) -- the same
+  // single source of truth --dump-dfg-json uses to TELL the external solver
+  // which tiles each FU class has ("fu_class_tiles"). So this verifies exactly
+  // the constraint the solver was handed, including its two distinct cases: a
+  // class the FU table does not describe is UNCONSTRAINED (every tile is legal,
+  // matching the solver's `fu_class_tiles.get(c, all_tiles)` fallback), while a
+  // described class that no tile provides is EMPTY (no legal tile at all).
+  //
+  // Reports every violation before returning, so a systematically wrong emit
+  // does not have to be debugged one op at a time.
+  static bool
+  validateImportedFuLegality(const std::vector<Operation *> &materialized,
+                             const Architecture &architecture,
+                             const std::vector<ImportedPlace> &places) {
+    llvm::StringMap<llvm::DenseSet<int>> legal_tiles_by_fu_class;
+    bool all_legal = true;
+    for (size_t i = 0; i < materialized.size(); ++i) {
+      Operation *op = materialized[i];
+      std::string fu_class = fuClassOf(op);
+      auto found = legal_tiles_by_fu_class.find(fu_class);
+      if (found == legal_tiles_by_fu_class.end()) {
+        llvm::DenseSet<int> tile_ids;
+        for (Tile *tile : tilesProvidingFuClass(architecture, fu_class)) {
+          tile_ids.insert(tile->getId());
+        }
+        found = legal_tiles_by_fu_class.insert({fu_class, std::move(tile_ids)})
+                    .first;
+      }
+      if (!found->second.contains(places[i].tile_id)) {
+        llvm::errs() << "[MapToAcceleratorPass] import-mapping illegal "
+                        "placement: op #"
+                     << i << " (" << op->getName() << ", fu class \""
+                     << fu_class << "\") placed on tile " << places[i].tile_id
+                     << ", whose functional units cannot run it. Legal tiles: ";
+        if (found->second.empty()) {
+          llvm::errs() << "(none on this architecture)";
+        } else {
+          llvm::SmallVector<int> sorted_ids(found->second.begin(),
+                                            found->second.end());
+          llvm::sort(sorted_ids);
+          llvm::interleaveComma(sorted_ids, llvm::errs());
+        }
+        llvm::errs() << ".\n";
+        all_legal = false;
+      }
+    }
+    if (!all_legal) {
+      llvm::errs() << "[MapToAcceleratorPass] import-mapping rejected: the "
+                      "imported solution is not executable on this "
+                      "architecture. Re-run the external mapper against the "
+                      "architecture spec in use (--dump-dfg-json emits its FU "
+                      "class -> tile table as \"fu_class_tiles\").\n";
+    }
+    return all_legal;
+  }
+
   // Parses an exact-mapper emit (compiled_ii + placements[{id,tile,time_step}]
   // and optional routes[{s,d,path}]).
   static bool parseImportedMapping(StringRef path, int &imported_ii,
@@ -333,6 +409,12 @@ struct MapToAcceleratorPass
           << materialized.size() << " materialized ops vs " << places.size()
           << " placements. The JSON must come from "
           << "--dump-dfg-json on this exact lowered IR.\n";
+      return false;
+    }
+    // An op may only be bound to a tile that can actually run it -- the same
+    // FU constraint the internal placer enforces (see
+    // validateImportedFuLegality).
+    if (!validateImportedFuLegality(materialized, architecture, places)) {
       return false;
     }
     // tile id -> tile resource, so an imported tile id becomes a MappingLoc.
@@ -445,6 +527,12 @@ struct MapToAcceleratorPass
       llvm::errs()
           << "[MapToAcceleratorPass] import-mapping op-count mismatch: "
           << materialized.size() << " vs " << places.size() << "\n";
+      return false;
+    }
+    // An op may only be bound to a tile that can actually run it -- the same
+    // FU constraint the internal placer enforces (see
+    // validateImportedFuLegality).
+    if (!validateImportedFuLegality(materialized, architecture, places)) {
       return false;
     }
     llvm::DenseMap<int, Tile *> tile_by_id;
@@ -756,45 +844,19 @@ struct MapToAcceleratorPass
     std::unique_ptr<Architecture> custom_arch;
     const Architecture *target_arch = &global_arch;
 
-    if (x_tiles.getValue() > 0 && y_tiles.getValue() > 0) {
-      std::vector<TileOverride> additional_overrides;
-      if (!valid_tiles.getValue().empty()) {
-        llvm::SmallVector<llvm::StringRef, 4> coords;
-        llvm::StringRef(valid_tiles.getValue()).split(coords, ',');
-
-        // Default: mark all tiles as non-existent first if valid_tiles
-        // provided.
-        for (int y = 0; y < y_tiles.getValue(); ++y) {
-          for (int x = 0; x < x_tiles.getValue(); ++x) {
-            TileOverride tile_override;
-            tile_override.tile_x = x;
-            tile_override.tile_y = y;
-            tile_override.existence = false;
-            additional_overrides.push_back(tile_override);
-          }
-        }
-
-        // Then mark the valid ones as existent.
-        for (llvm::StringRef coord : coords) {
-          auto coord_pair = coord.split('_');
-          int x, y;
-          if (!coord_pair.first.getAsInteger(10, x) &&
-              !coord_pair.second.getAsInteger(10, y)) {
-            TileOverride tile_override;
-            tile_override.tile_x = x;
-            tile_override.tile_y = y;
-            tile_override.existence = true;
-            additional_overrides.push_back(tile_override);
-          }
-        }
-      }
-
-      // Builds a custom architecture with the requested tile dimensions.
-      // For non-rectangular shapes, tiles marked existence=false are removed
-      // before inter-tile links are created, so no boundary links connect to
-      // absent tiles.
-      custom_arch = global_arch.cloneWithNewDimensions(
-          y_tiles.getValue(), x_tiles.getValue(), additional_overrides);
+    // Builds a custom architecture with the requested tile dimensions, minus
+    // every tile absent from `valid_tiles`. The parsing (and the reason valid
+    // tiles are LEFT ALONE rather than re-marked existent) lives in
+    // buildShapedArchitecture, shared with --cost-model-analytical,
+    // --dump-dfg-json and the task allocator so that every one of them prices a
+    // shape on the same tiles. Its inline predecessor here skipped the
+    // coordinate trim, the grid-bounds check and the empty-set fallback, so a
+    // mistyped list could hand the mapper the zero-tile architecture that same
+    // fallback exists to prevent.
+    custom_arch = buildShapedArchitecture(
+        global_arch, x_tiles.getValue(), y_tiles.getValue(),
+        valid_tiles.getValue(), "[MapToAcceleratorPass]");
+    if (custom_arch) {
       target_arch = custom_arch.get();
       llvm::errs()
           << "[MapToAcceleratorPass] Overriding architecture dimensions to "
